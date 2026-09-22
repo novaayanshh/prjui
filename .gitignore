@@ -22,4 +22,5 @@ venv/
 .DS_Store
 Thumbs.db
 .idea/
-.vscode/
+.vscode/*.png
+!utils/vendor/*.png
