@@ -1,0 +1,25 @@
+# Design database — SQLite .db, gitignored (only seed scripts are tracked)
+design_db.db
+*.db
+
+# Generated UIs, screenshots, run logs
+output/
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Local working docs (not shared)
+.doc/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
