@@ -1,5 +1,5 @@
-"""
-Stage 6 — UI Evaluator (Ayansh)
+﻿"""
+Stage 6 - UI Evaluator (Ayansh)
 
 Owns the Playwright render + evaluation half of the pipeline.
 Two entry points:
@@ -7,25 +7,26 @@ Two entry points:
   - evaluate_jsx(jsx_code, ...)    -> render a React .jsx component (Part B spike)
 
 Both funnel into `build_evaluation_report(...)` which shapes the
-evaluation.json contract defined in Part C.
+evaluation.json contract defined in Part C. Part D adds automated
+constraint checks (axe-core accessibility + touch-target sizing +
+text contrast) that run inside evaluate_jsx() before the browser closes.
 """
 
 import json
+import re
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+
+from utils.contrast import contrast_ratio
 
 VENDOR_DIR = Path(__file__).parent.parent / "utils" / "vendor"
 
 
 # ---------------------------------------------------------------------------
-# Part A — render raw HTML, screenshot, extract text
+# Part A - render raw HTML, screenshot, extract text
 # ---------------------------------------------------------------------------
 
 def evaluate_html(html: str, output_dir: str = "output", viewport: dict | None = None):
-    """
-    Render HTML using Playwright, take a screenshot, and extract visible page text.
-    Captures console/page errors instead of silently swallowing them.
-    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     screenshot_path = output_path / "ui_screenshot.png"
@@ -61,29 +62,14 @@ def evaluate_html(html: str, output_dir: str = "output", viewport: dict | None =
 
 
 # ---------------------------------------------------------------------------
-# Part B — render a JSX component headless (React + Babel standalone, vendored
-# locally so no network call is needed from inside the browser page)
+# Part B - render a JSX component headless
 # ---------------------------------------------------------------------------
 
 def _jsx_harness(jsx_code: str, component_name: str) -> str:
-    """
-    Builds a self-contained render harness.
-
-    Deliberately does NOT rely on Babel Standalone's <script type="text/babel">
-    auto-scan-and-execute behavior: that path (a) defaults to the "automatic"
-    JSX runtime, which injects a real `import` statement into the compiled
-    output and throws "Cannot use import statement outside a module" when
-    executed as a classic script, and (b) behaved inconsistently under
-    Playwright's page.set_content. Instead we call Babel.transform(...)
-    explicitly with the "classic" runtime (React.createElement calls, no
-    import) and eval the result via `new Function`, which is robust and
-    gives us a clean synchronous error to catch.
-    """
     react_js = (VENDOR_DIR / "react.production.min.js").read_text()
     react_dom_js = (VENDOR_DIR / "react-dom.production.min.js").read_text()
     babel_js = (VENDOR_DIR / "babel.min.js").read_text()
 
-    # strip //-style comment lines before handing to Babel so stray notes don't confuse it
     jsx_clean = "\n".join(
         line for line in jsx_code.splitlines() if not line.strip().startswith("//")
     )
@@ -115,16 +101,106 @@ try {{
 """
 
 
+# ---------------------------------------------------------------------------
+# Part D - automated constraint checks (defined before evaluate_jsx uses them)
+# ---------------------------------------------------------------------------
+
+AXE_JS_PATH = VENDOR_DIR / "axe.min.js"
+TOUCH_TARGET_MIN_PX = 24
+TEXT_CONTRAST_MIN = 4.5
+INTERACTIVE_SELECTOR = "button, a, input, select, textarea, [role='button']"
+
+
+def _run_axe(page) -> list[dict]:
+    page.add_script_tag(path=str(AXE_JS_PATH))
+    results = page.evaluate("""
+        async () => {
+            const r = await axe.run();
+            return r.violations.map(v => ({
+                id: v.id,
+                impact: v.impact,
+                help: v.help,
+                nodes: v.nodes.length
+            }));
+        }
+    """)
+    return [
+        {
+            "id": f"axe:{v['id']}",
+            "passed": False,
+            "actual": f"{v['nodes']} node(s) - {v['help']}",
+            "threshold": f"impact:{v['impact']}",
+        }
+        for v in results
+    ]
+
+
+def _check_touch_targets(page, min_px: int = TOUCH_TARGET_MIN_PX) -> list[dict]:
+    boxes = page.eval_on_selector_all(
+        INTERACTIVE_SELECTOR,
+        "els => els.map(el => { const r = el.getBoundingClientRect(); "
+        "return {tag: el.tagName, w: r.width, h: r.height}; })",
+    )
+    out = []
+    for i, b in enumerate(boxes):
+        ok = b["w"] >= min_px and b["h"] >= min_px
+        out.append({
+            "id": f"touch-target:{b['tag'].lower()}[{i}]",
+            "passed": ok,
+            "actual": f"{round(b['w'])}x{round(b['h'])}px",
+            "threshold": f"{min_px}x{min_px}px",
+        })
+    return out
+
+
+def _rgb_to_hex(rgb_str: str) -> str | None:
+    m = re.match(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", rgb_str or "")
+    if not m:
+        return None
+    return "#" + "".join(f"{int(x):02x}" for x in m.groups())
+
+
+def _check_text_contrast(page) -> list[dict]:
+    samples = page.eval_on_selector_all(
+        "p, span, h1, h2, h3, h4, h5, h6, button, a, li, label",
+        """els => els.map(el => {
+            const cs = getComputedStyle(el);
+            return {
+                tag: el.tagName,
+                text: el.innerText ? el.innerText.slice(0, 30) : '',
+                color: cs.color,
+                bg: cs.backgroundColor
+            };
+        }).filter(e => e.text.trim().length > 0)""",
+    )
+    out = []
+    for i, s in enumerate(samples):
+        fg_hex = _rgb_to_hex(s["color"])
+        bg_hex = _rgb_to_hex(s["bg"])
+        if not fg_hex or not bg_hex or s["bg"] == "rgba(0, 0, 0, 0)":
+            continue
+        ratio = contrast_ratio(fg_hex, bg_hex)
+        ok = ratio >= TEXT_CONTRAST_MIN
+        out.append({
+            "id": f"contrast:{s['tag'].lower()}[{i}]",
+            "passed": ok,
+            "actual": f"{ratio}:1",
+            "threshold": f"{TEXT_CONTRAST_MIN}:1",
+        })
+    return out
+
+
+def compute_constraints(page) -> list[dict]:
+    constraints = []
+    constraints += _run_axe(page)
+    constraints += _check_touch_targets(page)
+    constraints += _check_text_contrast(page)
+    return constraints
+
+
 def evaluate_jsx(jsx_code: str, component_name: str = "SpikeApp",
                   output_dir: str = "output", viewport: dict | None = None,
                   screenshot_name: str = "jsx_screenshot.png"):
-    """
-    Render a .jsx component headless via a vendored React+Babel harness.
-    Returns render_ok=False (not an exception) on broken JSX, with the
-    Babel/React error captured in `errors[]` — this is the "loud failure"
-    check from Part B.3, made non-fatal so the caller can log it as a
-    constraint failure rather than crashing the whole evaluation run.
-    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     screenshot_path = output_path / screenshot_name
@@ -141,7 +217,6 @@ def evaluate_jsx(jsx_code: str, component_name: str = "SpikeApp",
                  if msg.type == "error" else None)
 
         page.set_content(harness_html, wait_until="load")
-        # give Babel's in-page transpile + React 18's createRoot().render() a beat to finish
         page.wait_for_timeout(400)
 
         jsx_error = page.evaluate("window.__jsxError")
@@ -153,6 +228,8 @@ def evaluate_jsx(jsx_code: str, component_name: str = "SpikeApp",
 
         render_ok = bool(rendered_html.strip()) and not jsx_error
 
+        constraints = compute_constraints(page) if render_ok else []
+
         page.screenshot(path=str(screenshot_path), full_page=True)
         browser.close()
 
@@ -161,31 +238,32 @@ def evaluate_jsx(jsx_code: str, component_name: str = "SpikeApp",
         "screenshot": str(screenshot_path),
         "text": text,
         "errors": errors,
+        "constraints": constraints,
     }
 
 
 # ---------------------------------------------------------------------------
-# Part C — evaluation.json contract
+# Part C - evaluation.json contract
 # ---------------------------------------------------------------------------
 
 def build_evaluation_report(render_result: dict, constraints: list[dict] | None = None,
                              heuristics: list[dict] | None = None) -> dict:
-    """
-    Shapes the evaluation.json contract that Stage 7 (Critic) consumes.
-
-    render_ok    : did it render at all?
-    constraints[]: [{id, passed, actual, threshold}, ...]  -> RQ3 auditability
-    heuristics[] : [{heuristic, score (1-5), note}, ...]   -> Nielsen scores
-    errors[]     : console/render errors (the "loud failure" signal)
-    """
     return {
         "render_ok": render_result.get("rendered", False),
         "screenshot_path": render_result.get("screenshot"),
         "extracted_text": render_result.get("text", ""),
-        "constraints": constraints or [],
+        "constraints": constraints if constraints is not None else render_result.get("constraints", []),
         "heuristics": heuristics or [],
         "errors": render_result.get("errors", []),
     }
+
+
+def save_evaluation_report(report: dict, output_dir: str = "output", filename: str = "evaluation.json") -> str:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    file_path = output_path / filename
+    file_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(file_path)
 
 
 if __name__ == "__main__":
@@ -197,7 +275,7 @@ if __name__ == "__main__":
         <main>
             <h1>TraceUI Playwright Spike</h1>
             <h2>Ayansh Pandey</h2>
-            <p>Render → Screenshot → Text Extraction</p>
+            <p>Render -> Screenshot -> Text Extraction</p>
             <button>Test Button</button>
         </main>
     </body>
